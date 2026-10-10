@@ -1,0 +1,57 @@
+spring:
+  application:
+    name: load-balancer-gateway
+
+server:
+  port: 8080
+
+# ── Load-balancer tunables ────────────────────────────────────────────────────
+lb:
+  # K constant: maxCapacity = weight × capacityPerWeightUnit
+  capacity-per-weight-unit: 100
+
+  # Fractional tolerance when validating a caller-supplied maxCapacity (10 %)
+  max-capacity-deviation-fraction: 0.10
+
+  # Baseline token-bucket refill rate when all backends are healthy (req/s)
+  rate-limit-baseline-rps: 1000
+
+  # TCP connect timeout to a backend (ms)
+  connect-timeout-ms: 3000
+
+  # Max wait for first response byte from backend (ms)
+  response-timeout-ms: 30000
+
+  # Circuit breaker: rolling window (number of requests)
+  circuit-breaker-window-size: 20
+
+  # Circuit breaker: error fraction that trips the breaker open (50 %)
+  circuit-breaker-error-threshold: 0.50
+
+  # Circuit breaker: how long to stay OPEN before probing (ms)
+  circuit-breaker-open-duration-ms: 30000
+
+  # Caffeine cache: maximum cached response entries
+  cache-max-size: 10000
+
+  # Caffeine cache: response TTL (seconds)
+  cache-ttl-seconds: 60
+
+  # Maximum retry attempts for idempotent upstream failures
+  max-retries: 2
+
+# ── Actuator ──────────────────────────────────────────────────────────────────
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info,metrics
+  endpoint:
+    health:
+      show-details: always
+
+# ── Logging ───────────────────────────────────────────────────────────────────
+logging:
+  level:
+    com.loadbalancer: DEBUG
+    reactor.netty: WARN
