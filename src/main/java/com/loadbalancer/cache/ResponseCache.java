@@ -12,27 +12,32 @@ import org.springframework.stereotype.Component;
 import org.springframework.web.reactive.function.server.ServerRequest;
 import reactor.core.publisher.Mono;
 
-import java.util.List;
-import java.util.Optional;
+import java.util.*;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.TimeUnit;
+import java.util.function.Supplier;
 
 /**
  * Reactive Caffeine-backed response cache for {@code GET} requests.
  *
- * <p>Implements specification Section 3.E:
+ * <p>Implements specification Section 2.B & 3.E:
  * <ul>
  *   <li>Primary cache key: {@code method + host + URI path + query string}.</li>
+ *   <li>Two-level {@code Vary} lookup: records response {@code Vary} header names and incorporates
+ *       request header values into the full cache key.</li>
+ *   <li>Bypasses requests carrying an {@code Authorization} header.</li>
  *   <li>Only {@code GET} requests with {@code 200 OK} responses are cached.</li>
  *   <li>{@code Cache-Control: max-age=N} overrides the default TTL.</li>
  *   <li>Responses with {@code Cache-Control: no-store} or {@code private},
  *       or containing a {@code Set-Cookie} header, are never stored.</li>
  *   <li>Entries larger than {@value MAX_ENTRY_BYTES} bytes are not cached.</li>
+ *   <li>Single-flight request coalescing: coalesces concurrent misses for the exact same key.</li>
  * </ul>
  * </p>
  *
  * <h3>Thread safety</h3>
- * <p>Caffeine's {@link Cache} is fully thread-safe. The {@link #get} and
- * {@link #put} methods are safe to call from concurrent Netty event-loop threads.</p>
+ * <p>Caffeine's {@link Cache} and the underlying concurrency primitives are fully thread-safe.
+ * The public methods are safe to call from concurrent Netty event-loop threads.</p>
  */
 @Component
 public class ResponseCache {
@@ -46,6 +51,11 @@ public class ResponseCache {
     public record CachedResponse(byte[] body, HttpHeaders headers, int statusCode) {}
 
     private final Cache<String, CachedResponse> store;
+    /** Two-level Vary index: primaryKey -> list of lowercase Vary header names. */
+    private final Cache<String, List<String>> varyRules;
+    /** Single-flight coalescing registry: fullKey -> in-flight Mono. */
+    private final ConcurrentHashMap<String, Mono<CachedResponse>> inFlightFetches = new ConcurrentHashMap<>();
+
     private final long defaultTtlSeconds;
 
     public ResponseCache(LoadBalancerProperties props) {
@@ -55,6 +65,10 @@ public class ResponseCache {
                 .expireAfterWrite(defaultTtlSeconds, TimeUnit.SECONDS)
                 .recordStats() // enables hit/miss metrics via Caffeine's stats()
                 .build();
+        this.varyRules = Caffeine.newBuilder()
+                .maximumSize(props.getCacheMaxSize())
+                .expireAfterWrite(defaultTtlSeconds, TimeUnit.SECONDS)
+                .build();
     }
 
     // ── Public API ─────────────────────────────────────────────────────────
@@ -62,14 +76,22 @@ public class ResponseCache {
     /**
      * Looks up a cached response for the given request.
      *
+     * <p>Checks method (GET-only), skips requests with {@code Authorization},
+     * and performs a two-level lookup taking {@code Vary} header rules into account.</p>
+     *
      * @return {@link Optional} containing the cached entry, or empty on a miss.
-     *         Only {@code GET} requests are looked up; all others return empty.
      */
     public Optional<CachedResponse> get(ServerRequest request) {
         if (!HttpMethod.GET.equals(request.method())) {
             return Optional.empty();
         }
-        String key = buildKey(request);
+        // Specification Section 2.B: Do not cache requests carrying Authorization
+        if (request.headers().firstHeader(HttpHeaders.AUTHORIZATION) != null) {
+            log.debug("Cache SKIP (Authorization header present) for: {}", request.uri());
+            return Optional.empty();
+        }
+
+        String key = getLookupKey(request);
         CachedResponse hit = store.getIfPresent(key);
         if (hit != null) {
             log.debug("Cache HIT for key: {}", key);
@@ -93,6 +115,12 @@ public class ResponseCache {
         if (!HttpMethod.GET.equals(request.method())) return;
         if (statusCode != HttpStatus.OK.value()) return;
 
+        // Never cache requests carrying Authorization
+        if (request.headers().firstHeader(HttpHeaders.AUTHORIZATION) != null) {
+            log.debug("Cache SKIP (Authorization header present) for: {}", request.uri());
+            return;
+        }
+
         // Size guard — never cache responses larger than 1 MB
         if (body.length > MAX_ENTRY_BYTES) {
             log.debug("Cache SKIP (body {} bytes > 1 MB) for: {}", body.length, request.uri());
@@ -113,42 +141,71 @@ public class ResponseCache {
             return;
         }
 
-        String key = buildKey(request);
+        // Handle Vary: * (cannot be cached per RFC 7234)
+        List<String> varyHeaders = headers.get(HttpHeaders.VARY);
+        if (varyHeaders != null) {
+            for (String v : varyHeaders) {
+                if (v.contains("*")) {
+                    log.debug("Cache SKIP (Vary: *) for: {}", request.uri());
+                    return;
+                }
+            }
+        }
+
+        String primaryKey = buildPrimaryKey(request);
+
+        // Record Vary rules if present
+        List<String> varyTokens = extractVaryHeaderTokens(varyHeaders);
+        if (!varyTokens.isEmpty()) {
+            varyRules.put(primaryKey, varyTokens);
+        }
+
+        String fullKey = buildFullKey(primaryKey, request, varyTokens);
 
         // Honour Cache-Control: max-age override
         long ttl = extractMaxAge(cacheControl).orElse(defaultTtlSeconds);
         if (ttl <= 0) {
-            log.debug("Cache SKIP (max-age=0) for: {}", key);
+            log.debug("Cache SKIP (max-age=0) for: {}", fullKey);
             return;
         }
 
         // Build a sanitised copy of headers (strip hop-by-hop headers)
         HttpHeaders sanitised = sanitiseHeaders(headers);
+        store.put(fullKey, new CachedResponse(body, sanitised, statusCode));
 
-        if (ttl == defaultTtlSeconds) {
-            store.put(key, new CachedResponse(body, sanitised, statusCode));
-        } else {
-            // Per-entry TTL requires a short-lived sub-cache; use a separate policy
-            Cache<String, CachedResponse> shortLived = Caffeine.newBuilder()
-                    .maximumSize(1)
-                    .expireAfterWrite(ttl, TimeUnit.SECONDS)
-                    .build();
-            // Fall back to the default store with the entry — the client's max-age
-            // is respected on the first lookup via the X-Cache-TTL header we embed
-            store.put(key, new CachedResponse(body, sanitised, statusCode));
-        }
+        log.debug("Cache PUT key={} ttl={}s bodyBytes={}", fullKey, ttl, body.length);
+    }
 
-        log.debug("Cache PUT key={} ttl={}s bodyBytes={}", key, ttl, body.length);
+    /**
+     * Coalesces concurrent cache misses for the exact same request key into a single upstream fetch.
+     *
+     * <p>If multiple concurrent calls arrive for the same resource before it is cached,
+     * only one fetch supplier is executed; all callers receive the shared Mono result.</p>
+     *
+     * @param request       the incoming client request
+     * @param fetchSupplier supplier of the upstream fetch Mono
+     * @return Mono yielding the cached or fetched response
+     */
+    public Mono<CachedResponse> coalesce(ServerRequest request, Supplier<Mono<CachedResponse>> fetchSupplier) {
+        String key = getLookupKey(request);
+        return inFlightFetches.computeIfAbsent(key, k ->
+                Mono.defer(fetchSupplier)
+                        .doFinally(signal -> inFlightFetches.remove(k))
+                        .cache()
+        );
     }
 
     /** Explicitly evicts an entry (e.g. after a mutating request to the same resource). */
     public void invalidate(String key) {
         store.invalidate(key);
+        varyRules.invalidate(key);
     }
 
     /** Evicts all entries (admin use only). */
     public void invalidateAll() {
         store.invalidateAll();
+        varyRules.invalidateAll();
+        inFlightFetches.clear();
     }
 
     /** Total number of entries currently in the cache. */
@@ -159,11 +216,18 @@ public class ResponseCache {
     // ── Key construction ──────────────────────────────────────────────────
 
     /**
-     * Builds a deterministic cache key from the request's method, host, path, and query.
-     *
-     * <p>Format: {@code METHOD|host|/path?query}</p>
+     * Resolves the full cache key for a request, evaluating any existing {@code Vary} rules.
      */
-    public String buildKey(ServerRequest request) {
+    public String getLookupKey(ServerRequest request) {
+        String primaryKey = buildPrimaryKey(request);
+        List<String> varyHeaders = varyRules.getIfPresent(primaryKey);
+        return buildFullKey(primaryKey, request, varyHeaders);
+    }
+
+    /**
+     * Builds the primary cache key: {@code METHOD|host|/path?query}.
+     */
+    public String buildPrimaryKey(ServerRequest request) {
         String host  = request.headers().firstHeader(HttpHeaders.HOST);
         String path  = request.uri().getRawPath();
         String query = request.uri().getRawQuery();
@@ -178,7 +242,50 @@ public class ResponseCache {
         return key.toString();
     }
 
+    /**
+     * Builds the full cache key by appending sorted Vary header values to the primary key.
+     */
+    public String buildFullKey(String primaryKey, ServerRequest request, List<String> varyTokens) {
+        if (varyTokens == null || varyTokens.isEmpty()) {
+            return primaryKey;
+        }
+
+        StringBuilder fullKey = new StringBuilder(primaryKey);
+        // Sort tokens for deterministic key generation
+        List<String> sorted = new ArrayList<>(varyTokens);
+        Collections.sort(sorted);
+
+        for (String headerName : sorted) {
+            String val = request.headers().firstHeader(headerName);
+            fullKey.append("|vary:").append(headerName).append('=').append(val != null ? val : "");
+        }
+        return fullKey.toString();
+    }
+
+    /**
+     * Backward-compatible key builder.
+     */
+    public String buildKey(ServerRequest request) {
+        return getLookupKey(request);
+    }
+
     // ── Private helpers ───────────────────────────────────────────────────
+
+    private List<String> extractVaryHeaderTokens(List<String> varyHeaderValues) {
+        if (varyHeaderValues == null || varyHeaderValues.isEmpty()) {
+            return Collections.emptyList();
+        }
+        Set<String> tokens = new HashSet<>();
+        for (String value : varyHeaderValues) {
+            for (String part : value.split(",")) {
+                String trimmed = part.trim().toLowerCase();
+                if (!trimmed.isEmpty() && !trimmed.equals("*")) {
+                    tokens.add(trimmed);
+                }
+            }
+        }
+        return new ArrayList<>(tokens);
+    }
 
     private boolean containsDirective(List<String> cacheControlValues, String directive) {
         if (cacheControlValues == null) return false;

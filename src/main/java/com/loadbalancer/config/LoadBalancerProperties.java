@@ -65,6 +65,14 @@ public class LoadBalancerProperties {
     /** Maximum number of retry attempts for idempotent requests. */
     private int maxRetries = 2;
 
+    // ── Layer 4 TCP Tunnel ────────────────────────────────────────────────
+
+    /** Dedicated raw TCP listener port for L4 TLS/TCP tunneling (default: 8443). */
+    private int tunnelPort = 8443;
+
+    /** Whether the L4 TCP Tunnel proxy is active. */
+    private boolean tunnelEnabled = true;
+
     // ── Getters & Setters (required by @ConfigurationProperties) ─────────
 
     public int getCapacityPerWeightUnit()                { return capacityPerWeightUnit; }
@@ -99,4 +107,10 @@ public class LoadBalancerProperties {
 
     public int getMaxRetries()                           { return maxRetries; }
     public void setMaxRetries(int v)                     { this.maxRetries = v; }
+
+    public int getTunnelPort()                           { return tunnelPort; }
+    public void setTunnelPort(int v)                     { this.tunnelPort = v; }
+
+    public boolean isTunnelEnabled()                     { return tunnelEnabled; }
+    public void setTunnelEnabled(boolean v)              { this.tunnelEnabled = v; }
 }

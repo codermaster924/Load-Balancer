@@ -1,6 +1,6 @@
-# Custom Reactive L7 Load Balancer Gateway
+# Custom Reactive L7/L4 Load Balancer & Edge Gateway
 
-A high-performance, non-blocking L7 Reverse Proxy and Load Balancer built from scratch with **Java 21**, **Spring Boot 3 (WebFlux)**, and **Reactor Netty**.
+A high-performance, non-blocking L7 Reverse Proxy, L4 TCP Tunnel, and Load Balancer built from scratch with **Java 21**, **Spring Boot 3 (WebFlux)**, and **Reactor Netty**.
 
 ---
 
@@ -18,15 +18,23 @@ A high-performance, non-blocking L7 Reverse Proxy and Load Balancer built from s
 - **Streaming Request/Response**: Memory-efficient streaming of request and response bodies.
 - **Header Management**: Injects standard `X-Forwarded-For`, `X-Forwarded-Host`, `X-Forwarded-Proto` and strips hop-by-hop headers (`Connection`, `Keep-Alive`, `Transfer-Encoding`, etc.).
 
-### 3. Resilience & Traffic Shaping
+### 3. Layer 4 TCP Tunnel / TLS Fallback Proxy
+- **Raw Duplex Byte Tunneling**: Runs on a dedicated raw TCP listener (`lb.tunnel-port`, default `8443`), bypassing L7 inspection and TLS termination.
+- **SNI Inspection**: Non-destructively parses Server Name Indication (SNI) from TLS `ClientHello` packets for logging and telemetry.
+- **Unified Accounting**: Shares the exact same capacity limits and in-flight connection tracking as the L7 proxy.
+
+### 4. Resilience & Traffic Shaping
 - **Adaptive Token Bucket Rate Limiting**: Token refill rate dynamically scales based on aggregate fleet health (EWMA score) to protect downstreams and prevent cascading failures.
 - **Peak-EWMA & Weighted Least Connections**: Routes traffic to the backend with the best combination of weight, low active connection count, and low latency.
+- **Smooth Weighted Round Robin Overflow**: Engages nginx's Smooth WRR algorithm to distribute overflow traffic proportionally when all nodes are at capacity.
 - **Per-Node Circuit Breakers**: Automatically opens circuits when consecutive failures or error thresholds are met, avoiding sickly backends.
 - **Token-Bucket Retry Budget**: Retries idempotent requests (GET, HEAD, etc.) on alternative healthy nodes while strictly preventing retry storms.
 
-### 4. Intelligent Caching
+### 5. Advanced In-Memory Caching
 - **RFC-Compliant GET Response Cache**: Powered by **Caffeine** with configurable size and TTL.
-- Respects `Cache-Control` (`no-store`, `private`, `max-age`), ignores responses setting `Set-Cookie`, and caps entry sizes to 1MB.
+- **Two-Level `Vary` Header Partitioning**: Indexes variants (e.g. `Accept-Encoding`) to serve distinct encodings correctly.
+- **Single-Flight Request Coalescing**: Coalesces concurrent cache misses for the same resource into a single upstream fetch to prevent cache stampedes.
+- **Security & Privacy Guards**: Bypasses requests with `Authorization`, ignores responses setting `Set-Cookie`, respects `Cache-Control: no-store/private`, and caps entry sizes to 1MB.
 
 ---
 
