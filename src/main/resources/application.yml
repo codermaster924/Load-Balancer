@@ -53,5 +53,6 @@ management:
 # ── Logging ───────────────────────────────────────────────────────────────────
 logging:
   level:
-    com.loadbalancer: DEBUG
+    # INFO by default: DEBUG logs a line per request and distorts benchmark results.
+    com.loadbalancer: INFO
     reactor.netty: WARN

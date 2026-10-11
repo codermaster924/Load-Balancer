@@ -1,14 +1,17 @@
 package com.loadbalancer.routing;
 
-import com.loadbalancer.resilience.CircuitBreakerRegistry;
+import java.util.ArrayList;
+import java.util.List;
+import java.util.Optional;
+import java.util.Set;
+import java.util.concurrent.atomic.AtomicLong;
+import java.util.concurrent.locks.ReentrantLock;
+
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.stereotype.Component;
 
-import java.util.ArrayList;
-import java.util.List;
-import java.util.Optional;
-import java.util.concurrent.locks.ReentrantLock;
+import com.loadbalancer.resilience.CircuitBreakerRegistry;
 
 /**
  * Custom routing engine implementing the hybrid load balancing algorithm:
@@ -30,6 +33,9 @@ public class SelectionEngine {
 
     private static final Logger log = LoggerFactory.getLogger(SelectionEngine.class);
 
+    /** Minimum gap between "no eligible backend" warnings, so an outage cannot flood the log. */
+    private static final long EMPTY_POOL_WARN_INTERVAL_MS = 10_000;
+
     private final BackendRegistry backendRegistry;
     private final CircuitBreakerRegistry circuitBreakerRegistry;
 
@@ -39,6 +45,9 @@ public class SelectionEngine {
      * in currentWeight calculations.
      */
     private final ReentrantLock wrrLock = new ReentrantLock();
+
+    /** Wall-clock time (ms) of the last "no eligible backend" warning. */
+    private final AtomicLong lastEmptyPoolWarnMs = new AtomicLong(0);
 
     public SelectionEngine(BackendRegistry backendRegistry, CircuitBreakerRegistry circuitBreakerRegistry) {
         this.backendRegistry = backendRegistry;
@@ -56,10 +65,22 @@ public class SelectionEngine {
      *         no healthy/non-tripped backends are available.
      */
     public Optional<ServerNode> selectNode() {
+        return selectNode(Set.of());
+    }
+
+    /**
+     * Same as {@link #selectNode()}, but never returns a node whose id is in {@code excludedIds}.
+     *
+     * <p>Used by the proxy when retrying: the node that just failed is removed from this
+     * request's candidate pool. The exclusion only narrows the pool, so the algorithm itself
+     * (WLC, caps, WRR overflow) is unchanged.</p>
+     */
+    public Optional<ServerNode> selectNode(Set<String> excludedIds) {
         while (true) {
-            List<ServerNode> eligible = getEligibleNodes();
+            List<ServerNode> healthy = getEligibleNodes();
+            List<ServerNode> eligible = withoutExcluded(healthy, excludedIds);
             if (eligible.isEmpty()) {
-                log.warn("No eligible backend nodes available (pool is empty, unhealthy, or circuit tripped)");
+                warnEmptyPoolRateLimited(excludedIds.isEmpty());
                 return Optional.empty();
             }
 
@@ -73,7 +94,7 @@ public class SelectionEngine {
 
             // Step 3: If ALL eligible servers are at or over capacity, trigger Smooth WRR overflow
             if (underCap.isEmpty()) {
-                ServerNode overflowNode = selectBySmoothWrr(eligible);
+                ServerNode overflowNode = selectBySmoothWrr(eligible, healthy);
                 log.debug("WLC capacity exhausted on all eligible nodes. Overflow routed to {} via Smooth WRR",
                         overflowNode.getId());
                 return Optional.of(overflowNode);
@@ -84,8 +105,11 @@ public class SelectionEngine {
 
             // Reserve the slot atomically via CAS check-and-increment
             if (candidate.tryReserveSlot()) {
-                log.debug("Routed to {} via WLC (score={:.3f}, active={})",
-                        candidate.getId(), candidate.wlcScore(), candidate.getActiveConnections());
+                // SLF4J only understands "{}", so the score is formatted up front; guarded to keep the hot path free of String.format.
+                if (log.isDebugEnabled()) {
+                    log.debug("Routed to {} via WLC (score={}, active={})", candidate.getId(),
+                            String.format("%.3f", candidate.wlcScore()), candidate.getActiveConnections());
+                }
                 return Optional.of(candidate);
             }
 
@@ -112,6 +136,47 @@ public class SelectionEngine {
             }
         }
         return eligible;
+    }
+
+    /**
+     * Whether at least one healthy, non-tripped node exists outside {@code excludedIds}.
+     * Lets the proxy check that a retry has somewhere to go before it spends retry budget.
+     */
+    public boolean hasAlternative(Set<String> excludedIds) {
+        for (ServerNode node : getEligibleNodes()) {
+            if (!excludedIds.contains(node.getId())) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private static List<ServerNode> withoutExcluded(List<ServerNode> nodes, Set<String> excludedIds) {
+        if (excludedIds.isEmpty()) {
+            return nodes;
+        }
+        List<ServerNode> remaining = new ArrayList<>(nodes.size());
+        for (ServerNode node : nodes) {
+            if (!excludedIds.contains(node.getId())) {
+                remaining.add(node);
+            }
+        }
+        return remaining;
+    }
+
+    /**
+     * Logs "no eligible backend" at most once per {@link #EMPTY_POOL_WARN_INTERVAL_MS}.
+     * An empty pool after retry exclusions is expected, so it is never warned about.
+     */
+    private void warnEmptyPoolRateLimited(boolean noExclusions) {
+        if (!noExclusions) {
+            return;
+        }
+        long now = System.currentTimeMillis();
+        long last = lastEmptyPoolWarnMs.get();
+        if (now - last >= EMPTY_POOL_WARN_INTERVAL_MS && lastEmptyPoolWarnMs.compareAndSet(last, now)) {
+            log.warn("No eligible backend nodes available (pool is empty, unhealthy, or circuit tripped)");
+        }
     }
 
     /**
@@ -161,10 +226,23 @@ public class SelectionEngine {
      *   <li>Increment the chosen node's in-flight connection counter.</li>
      * </ol>
      * </p>
+     *
+     * @param eligible candidates for this request (healthy, breaker not open, not excluded by a retry)
+     * @param healthy  every node that is healthy with a non-open breaker; nodes outside this set
+     *                 have their WRR state reset so they do not return with a stale balance
      */
-    private ServerNode selectBySmoothWrr(List<ServerNode> eligible) {
+    private ServerNode selectBySmoothWrr(List<ServerNode> eligible, List<ServerNode> healthy) {
         wrrLock.lock();
         try {
+            // A node that left the pool (unhealthy / breaker open) keeps its old currentWeight.
+            // When it returns that stale balance would give it a burst of traffic, so start it from zero.
+            // Uses `healthy`, not `eligible`, so a per-request retry exclusion never disturbs WRR state.
+            for (ServerNode node : backendRegistry.allNodes()) {
+                if (!healthy.contains(node)) {
+                    node.setCurrentWeight(0);
+                }
+            }
+
             int totalWeight = 0;
             ServerNode bestNode = null;
             int maxWeight = Integer.MIN_VALUE;

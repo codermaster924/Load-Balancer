@@ -1,22 +1,27 @@
 package com.loadbalancer.routing;
 
-import com.loadbalancer.config.LoadBalancerProperties;
-import com.loadbalancer.resilience.CircuitBreakerRegistry;
-import org.junit.jupiter.api.BeforeEach;
-import org.junit.jupiter.api.DisplayName;
-import org.junit.jupiter.api.Test;
-
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.Set;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
 
-import static org.junit.jupiter.api.Assertions.*;
+import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertNotNull;
+import static org.junit.jupiter.api.Assertions.assertThrows;
+import static org.junit.jupiter.api.Assertions.assertTrue;
+import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.api.DisplayName;
+import org.junit.jupiter.api.Test;
+
+import com.loadbalancer.config.LoadBalancerProperties;
+import com.loadbalancer.resilience.CircuitBreakerRegistry;
 
 /**
  * Comprehensive unit tests for {@link SelectionEngine}:
@@ -264,5 +269,72 @@ class SelectionEngineTest {
                 .sum();
 
         assertEquals(totalRequests, sumActive, "Total active connections must exactly match total selections made");
+    }
+
+    // ── Retry exclusions (used by the proxy when a node fails) ────────────
+
+    @Test
+    @DisplayName("selectNode(excluded) never returns an excluded node")
+    void exclusionSkipsExcludedNodes() {
+        backendRegistry.register("n1", "http://localhost:8081", 5, 0); // would win the tie-break
+        backendRegistry.register("n2", "http://localhost:8082", 1, 0);
+
+        ServerNode selected = engine.selectNode(Set.of("n1")).orElseThrow();
+        assertEquals("n2", selected.getId());
+    }
+
+    @Test
+    @DisplayName("selectNode(excluded) is empty when every eligible node is excluded")
+    void exclusionOfEveryNodeReturnsEmpty() {
+        backendRegistry.register("n1", "http://localhost:8081", 5, 0);
+        backendRegistry.register("n2", "http://localhost:8082", 1, 0);
+
+        assertTrue(engine.selectNode(Set.of("n1", "n2")).isEmpty());
+    }
+
+    @Test
+    @DisplayName("hasAlternative reflects health, breaker state and exclusions")
+    void hasAlternativeChecksEligibilityAndExclusions() {
+        ServerNode n1 = backendRegistry.register("n1", "http://localhost:8081", 5, 0);
+        backendRegistry.register("n2", "http://localhost:8082", 1, 0);
+
+        assertTrue(engine.hasAlternative(Set.of("n1")));       // n2 remains
+        assertFalse(engine.hasAlternative(Set.of("n1", "n2"))); // nothing left
+
+        n1.setHealthy(false);
+        assertFalse(engine.hasAlternative(Set.of("n2")));       // n1 is excluded by health, n2 by the set
+    }
+
+    // ── Smooth WRR state hygiene ──────────────────────────────────────────
+
+    @Test
+    @DisplayName("WRR resets currentWeight of nodes that left the healthy pool")
+    void wrrResetsStateOfNodesOutsideThePool() {
+        props.setCapacityPerWeightUnit(1);
+        ServerNode n1 = backendRegistry.register("n1", "http://localhost:8081", 3, 0); // cap 3
+        ServerNode n2 = backendRegistry.register("n2", "http://localhost:8082", 1, 0); // cap 1
+        for (int i = 0; i < 3; i++) n1.incrementConnections();
+        n2.incrementConnections();
+
+        engine.selectNodeOrThrow();                 // overflow: n1 wins, leaving n1.currentWeight = -1
+        assertEquals(-1, n1.getCurrentWeight());
+
+        n1.setHealthy(false);                       // n1 leaves the pool...
+        assertEquals("n2", engine.selectNodeOrThrow().getId());
+        assertEquals(0, n1.getCurrentWeight());     // ...and its stale balance is cleared
+    }
+
+    @Test
+    @DisplayName("a retry exclusion does not disturb WRR state of healthy nodes")
+    void exclusionDoesNotResetWrrState() {
+        props.setCapacityPerWeightUnit(1);
+        ServerNode n1 = backendRegistry.register("n1", "http://localhost:8081", 3, 0);
+        ServerNode n2 = backendRegistry.register("n2", "http://localhost:8082", 1, 0);
+        for (int i = 0; i < 3; i++) n1.incrementConnections();
+        n2.incrementConnections();
+
+        engine.selectNodeOrThrow();                 // n1.currentWeight = -1
+        assertEquals("n2", engine.selectNode(Set.of("n1")).orElseThrow().getId());
+        assertEquals(-1, n1.getCurrentWeight());    // n1 is healthy, merely excluded for one request
     }
 }
