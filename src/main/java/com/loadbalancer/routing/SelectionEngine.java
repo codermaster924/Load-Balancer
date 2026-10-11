@@ -103,6 +103,11 @@ public class SelectionEngine {
             // Pick best WLC candidate (lowest score = activeConnections / weight, tie break by highest weight)
             ServerNode candidate = selectWlcCandidate(underCap);
 
+            boolean isHalfOpen = circuitBreakerRegistry.getState(candidate.getId()) == com.loadbalancer.resilience.CircuitBreakerState.HALF_OPEN;
+            if (isHalfOpen && !circuitBreakerRegistry.tryAcquireProbe(candidate.getId())) {
+                continue; // probe permit already claimed, re-evaluate
+            }
+
             // Reserve the slot atomically via CAS check-and-increment
             if (candidate.tryReserveSlot()) {
                 // SLF4J only understands "{}", so the score is formatted up front; guarded to keep the hot path free of String.format.
@@ -111,6 +116,10 @@ public class SelectionEngine {
                             String.format("%.3f", candidate.wlcScore()), candidate.getActiveConnections());
                 }
                 return Optional.of(candidate);
+            }
+
+            if (isHalfOpen) {
+                circuitBreakerRegistry.releaseProbePermit(candidate.getId());
             }
 
             // CAS failed because another thread updated connections.
@@ -126,12 +135,12 @@ public class SelectionEngine {
     }
 
     /**
-     * Returns all registered nodes that are healthy and whose circuit breakers are not open.
+     * Returns all registered nodes that are healthy and whose circuit breakers can accept traffic.
      */
     public List<ServerNode> getEligibleNodes() {
         List<ServerNode> eligible = new ArrayList<>();
         for (ServerNode node : backendRegistry.allNodes()) {
-            if (node.isHealthy() && !circuitBreakerRegistry.isOpen(node.getId())) {
+            if (node.isHealthy() && circuitBreakerRegistry.canAcceptTraffic(node.getId())) {
                 eligible.add(node);
             }
         }

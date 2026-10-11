@@ -1,6 +1,7 @@
 package com.loadbalancer.proxy;
 
 import com.loadbalancer.config.LoadBalancerProperties;
+import com.loadbalancer.resilience.CircuitBreakerRegistry;
 import com.loadbalancer.resilience.RetryBudget;
 import com.loadbalancer.routing.NoAvailableBackendException;
 import com.loadbalancer.routing.SelectionEngine;
@@ -68,15 +69,18 @@ public class ReverseProxyHandler {
     private final SelectionEngine selectionEngine;
     private final WebClient webClient;
     private final RetryBudget retryBudget;
+    private final CircuitBreakerRegistry circuitBreakerRegistry;
     private final LoadBalancerProperties props;
 
     public ReverseProxyHandler(SelectionEngine selectionEngine,
                                WebClient webClient,
                                RetryBudget retryBudget,
+                               CircuitBreakerRegistry circuitBreakerRegistry,
                                LoadBalancerProperties props) {
         this.selectionEngine = selectionEngine;
         this.webClient = webClient;
         this.retryBudget = retryBudget;
+        this.circuitBreakerRegistry = circuitBreakerRegistry;
         this.props = props;
     }
 
@@ -152,6 +156,13 @@ public class ReverseProxyHandler {
                                                         boolean canRetry) {
         HttpStatusCode status = clientResponse.statusCode();
 
+        // Record circuit breaker outcome: 5xx is an error; 2xx/3xx/4xx is a success
+        if (status.is5xxServerError()) {
+            circuitBreakerRegistry.recordError(reservation.getNode().getId());
+        } else {
+            circuitBreakerRegistry.recordSuccess(reservation.getNode().getId());
+        }
+
         // Check if status is a retryable server error (502, 503, 504)
         if (isRetryableStatus(status) && canRetry && canAttemptRetry(reservation.getNode().getId(), excludedIds)) {
             log.warn("Upstream {} returned {}. Retrying on alternative node (attempt {}/{})",
@@ -186,6 +197,7 @@ public class ReverseProxyHandler {
                                                      boolean canRetry) {
         String failedNodeId = reservation.getNode().getId();
         reservation.release();
+        circuitBreakerRegistry.recordError(failedNodeId);
 
         if (canRetry && canAttemptRetry(failedNodeId, excludedIds)) {
             log.warn("Upstream {} failed with '{}'. Retrying on alternative node (attempt {}/{})",

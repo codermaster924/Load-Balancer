@@ -1,38 +1,104 @@
 package com.loadbalancer.resilience;
 
+import com.loadbalancer.config.LoadBalancerProperties;
 import org.springframework.stereotype.Component;
 
 import java.util.concurrent.ConcurrentHashMap;
 
 /**
- * Registry that maps each backend node id to its circuit-breaker state.
+ * Thread-safe registry mapping each backend {@code nodeId} to its {@link CircuitBreaker}.
  *
- * <p><b>Step 2 stub:</b> defaults to CLOSED (not open) so {@link com.loadbalancer.routing.SelectionEngine}
- * can be built and fully tested before the rolling-window error-rate logic is introduced.
- * Step 4 replaces this with a real per-node {@link CircuitBreakerState} tracker without
- * changing the {@code SelectionEngine} contract.</p>
+ * <p>All subsystems (selection engine, proxy handler, and metrics endpoint) interact
+ * with circuit breaker states through this component.</p>
  */
 @Component
 public class CircuitBreakerRegistry {
 
-    private final ConcurrentHashMap<String, Boolean> openStates = new ConcurrentHashMap<>();
+    private final LoadBalancerProperties props;
+    private final ConcurrentHashMap<String, CircuitBreaker> breakers = new ConcurrentHashMap<>();
 
-    /**
-     * Returns {@code true} if the circuit for {@code nodeId} is OPEN and the
-     * node must be excluded from backend selection.
-     */
-    public boolean isOpen(String nodeId) {
-        return openStates.getOrDefault(nodeId, false);
+    public CircuitBreakerRegistry(LoadBalancerProperties props) {
+        this.props = props;
     }
 
     /**
-     * Helper for testing or administrative circuit state control.
+     * Default constructor for test harnesses where default properties suffice.
+     */
+    public CircuitBreakerRegistry() {
+        this(new LoadBalancerProperties());
+    }
+
+    /**
+     * Returns the circuit breaker for {@code nodeId}, creating one if not present.
+     */
+    public CircuitBreaker getOrCreate(String nodeId) {
+        return breakers.computeIfAbsent(nodeId, id -> new CircuitBreaker(id, props));
+    }
+
+    /**
+     * Returns {@code true} if the circuit for {@code nodeId} is currently OPEN
+     * and the node must be excluded from traffic routing.
+     */
+    public boolean isOpen(String nodeId) {
+        CircuitBreaker cb = breakers.get(nodeId);
+        return cb != null && cb.isOpen();
+    }
+
+    /**
+     * Returns {@code true} if the circuit breaker can accept traffic.
+     */
+    public boolean canAcceptTraffic(String nodeId) {
+        CircuitBreaker cb = breakers.get(nodeId);
+        return cb == null || cb.canAcceptTraffic();
+    }
+
+    public boolean tryAcquireProbe(String nodeId) {
+        return getOrCreate(nodeId).tryAcquireProbe();
+    }
+
+    public void releaseProbePermit(String nodeId) {
+        CircuitBreaker cb = breakers.get(nodeId);
+        if (cb != null) {
+            cb.releaseProbePermit();
+        }
+    }
+
+    /**
+     * Records a successful upstream request for {@code nodeId}.
+     */
+    public void recordSuccess(String nodeId) {
+        getOrCreate(nodeId).recordSuccess();
+    }
+
+    /**
+     * Records a failed upstream request (connect error, timeout, or 5xx) for {@code nodeId}.
+     */
+    public void recordError(String nodeId) {
+        getOrCreate(nodeId).recordError();
+    }
+
+    /**
+     * Returns the current {@link CircuitBreakerState} for {@code nodeId}.
+     */
+    public CircuitBreakerState getState(String nodeId) {
+        return getOrCreate(nodeId).getState();
+    }
+
+    /**
+     * Directly overrides the circuit breaker state for a node (used in testing).
      */
     public void setOpen(String nodeId, boolean open) {
+        CircuitBreaker cb = getOrCreate(nodeId);
         if (open) {
-            openStates.put(nodeId, true);
+            cb.recordError();
+            // Force open timestamp
+            cb.setOpenTimestampMs(System.currentTimeMillis());
+            // Set state directly by triggering threshold
+            for (int i = 0; i < props.getCircuitBreakerWindowSize(); i++) {
+                cb.recordError();
+            }
         } else {
-            openStates.remove(nodeId);
+            cb.resetToClosed();
         }
     }
 }

@@ -59,7 +59,7 @@ class ReverseProxyTest {
         retryBudget = new RetryBudget(props);
 
         ProxyClientConfig clientConfig = new ProxyClientConfig();
-        proxyHandler = new ReverseProxyHandler(selectionEngine, clientConfig.proxyWebClient(props), retryBudget, props);
+        proxyHandler = new ReverseProxyHandler(selectionEngine, clientConfig.proxyWebClient(props), retryBudget, circuitBreakerRegistry, props);
 
         ProxyRouterConfig routerConfig = new ProxyRouterConfig();
         client = WebTestClient.bindToRouterFunction(routerConfig.proxyRoutes(proxyHandler)).build();
