@@ -44,15 +44,19 @@ Every incoming HTTP request traverses the following pipeline order:
 
 ```mermaid
 graph TD
-    Client[Downstream Client] -->|HTTP Request| RateLimiter[1. Adaptive Rate Limiter]
+    Client[Client Traffic] -->|Port 8080 HTTP| RateLimiter[1. Adaptive Rate Limiter]
+    Client -->|Port 8443 TCP/TLS| L4Tunnel[L4 TCP Tunnel & SNI Inspector]
+    L4Tunnel --> Selection[Selection Engine (Peak-EWMA / Least-Conn)]
+    Selection -->|L4 Duplex Forward| UpstreamTCP[Upstream Backend TCP]
+
     RateLimiter -->|Bucket Empty| R429[429 Too Many Requests]
     RateLimiter -->|Token Acquired| CacheCheck[2. Response Cache Lookup]
     CacheCheck -->|Cache Hit (GET)| CachedResponse[Return Cached 200]
-    CacheCheck -->|Cache Miss| Selection[3. Selection Engine (Peak-EWMA / Least-Conn)]
-    Selection -->|No Nodes Available| R503[503 Service Unavailable]
-    Selection -->|Node Selected| Forward[4. Upstream WebClient]
+    CacheCheck -->|Cache Miss| SelectionL7[3. Selection Engine (Peak-EWMA / Least-Conn)]
+    SelectionL7 -->|No Nodes Available| R503[503 Service Unavailable]
+    SelectionL7 -->|Node Selected| Forward[4. Upstream WebClient]
     Forward -->|502/503/504 / Network Fail| RetryBudgetCheck{Can Retry & Budget Available?}
-    RetryBudgetCheck -->|Yes| Selection
+    RetryBudgetCheck -->|Yes| SelectionL7
     RetryBudgetCheck -->|No| GatewayError[Error Response]
     Forward -->|Success 200 GET| CacheStore[Store in Caffeine Cache]
     CacheStore --> StreamDownstream[Stream to Downstream Client]
@@ -64,17 +68,31 @@ graph TD
 ## ⚙️ Configuration (`application.yml`)
 
 ```yaml
-load-balancer:
+lb:
+  # Capacity & Equity
   capacity-per-weight-unit: 100
-  connect-timeout-ms: 2000
-  response-timeout-ms: 5000
+  max-capacity-deviation-fraction: 0.10
+
+  # Timeouts & Retries
+  connect-timeout-ms: 3000
+  response-timeout-ms: 30000
   max-retries: 2
-  retry-budget-fraction: 0.10
-  rate-limit-baseline-rps: 10000
-  cache-max-entries: 50000
-  cache-default-ttl-seconds: 60
-  health-check-interval-seconds: 10
-  health-check-path: /health
+
+  # Adaptive Rate Limiting
+  rate-limit-baseline-rps: 1000
+
+  # Circuit Breakers
+  circuit-breaker-window-size: 20
+  circuit-breaker-error-threshold: 0.50
+  circuit-breaker-open-duration-ms: 30000
+
+  # Caffeine In-Memory Cache
+  cache-max-size: 10000
+  cache-ttl-seconds: 60
+
+  # Layer 4 TCP Tunnel
+  tunnel-port: 8443
+  tunnel-enabled: true
 ```
 
 ---
@@ -93,7 +111,7 @@ curl -X POST http://localhost:8080/lb/backends \
   }'
 ```
 
-### 2. Remove a Backend Node
+### 2. Remove a Backend Node (Graceful Drain)
 ```bash
 curl -X DELETE http://localhost:8080/lb/backends/srv-1
 ```
@@ -106,18 +124,20 @@ curl http://localhost:8080/lb/metrics
 **Response Example:**
 ```json
 {
-  "totalNodes": 2,
-  "healthyNodes": 2,
+  "totalBackends": 1,
+  "healthyBackends": 1,
   "aggregateHealthScore": 100.0,
+  "globalRateLimitThreshold": 1000,
   "nodes": [
     {
       "id": "srv-1",
       "url": "http://192.168.1.10:8081",
       "weight": 5,
+      "maxCapacity": 500,
       "activeConnections": 0,
-      "healthy": true,
+      "isHealthy": true,
       "healthScore": 100.0,
-      "circuitState": "CLOSED"
+      "circuitBreakerState": "CLOSED"
     }
   ]
 }
