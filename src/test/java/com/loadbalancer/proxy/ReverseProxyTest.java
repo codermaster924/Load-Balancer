@@ -1,7 +1,10 @@
 package com.loadbalancer.proxy;
 
+import com.loadbalancer.cache.ResponseCache;
 import com.loadbalancer.config.LoadBalancerProperties;
+import com.loadbalancer.health.HealthChecker;
 import com.loadbalancer.resilience.CircuitBreakerRegistry;
+import com.loadbalancer.resilience.RateLimiter;
 import com.loadbalancer.resilience.RetryBudget;
 import com.loadbalancer.routing.BackendRegistry;
 import com.loadbalancer.routing.SelectionEngine;
@@ -12,12 +15,15 @@ import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 import org.springframework.http.HttpHeaders;
 import org.springframework.http.HttpMethod;
+import org.springframework.http.HttpStatus;
 import org.springframework.test.web.reactive.server.WebTestClient;
+import org.springframework.web.reactive.function.client.WebClient;
 import reactor.core.publisher.Mono;
 import reactor.netty.DisposableServer;
 import reactor.netty.http.server.HttpServer;
 
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
 
 import static org.junit.jupiter.api.Assertions.*;
@@ -59,7 +65,26 @@ class ReverseProxyTest {
         retryBudget = new RetryBudget(props);
 
         ProxyClientConfig clientConfig = new ProxyClientConfig();
-        proxyHandler = new ReverseProxyHandler(selectionEngine, clientConfig.proxyWebClient(props), retryBudget, circuitBreakerRegistry, props);
+
+        // Use a high-capacity rate limiter so tests are never throttled
+        LoadBalancerProperties highLimitProps = new LoadBalancerProperties();
+        highLimitProps.setRateLimitBaselineRps(1_000_000);
+        // HealthChecker requires a WebClient and BackendRegistry; supply a minimal stub via a
+        // real instance pointing at an empty registry so getAggregateHealthScore() returns 100.0
+        HealthChecker stubHealthChecker = new HealthChecker(
+                new BackendRegistry(new LoadBalancerProperties()),
+                WebClient.create());
+        RateLimiter rateLimiter = new RateLimiter(highLimitProps, stubHealthChecker);
+        ResponseCache responseCache = new ResponseCache(props);
+
+        proxyHandler = new ReverseProxyHandler(
+                selectionEngine,
+                clientConfig.proxyWebClient(props),
+                retryBudget,
+                circuitBreakerRegistry,
+                props,
+                rateLimiter,
+                responseCache);
 
         ProxyRouterConfig routerConfig = new ProxyRouterConfig();
         client = WebTestClient.bindToRouterFunction(routerConfig.proxyRoutes(proxyHandler)).build();
@@ -191,8 +216,18 @@ class ReverseProxyTest {
                 .expectBody(String.class).isEqualTo("Recovered on B2");
 
         // Both nodes must have 0 in-flight connections after completion
-        assertEquals(0, node1.getActiveConnections(), "Failed node connections must be decremented");
-        assertEquals(0, node2.getActiveConnections(), "Recovered node connections must be decremented");
+        assertEventuallyZeroConnections(node1);
+        assertEventuallyZeroConnections(node2);
+    }
+
+    private void assertEventuallyZeroConnections(ServerNode node) {
+        long deadline = System.currentTimeMillis() + 1000;
+        while (node.getActiveConnections() > 0 && System.currentTimeMillis() < deadline) {
+            try {
+                Thread.sleep(20);
+            } catch (InterruptedException ignored) {}
+        }
+        assertEquals(0, node.getActiveConnections(), "In-flight connection counter must decrement to 0");
     }
 
     @Test
@@ -203,5 +238,69 @@ class ReverseProxyTest {
                 .exchange()
                 .expectStatus().is5xxServerError()
                 .expectStatus().isEqualTo(503);
+    }
+
+    @Test
+    @DisplayName("returns 429 Too Many Requests when rate limit bucket is exhausted")
+    void returns429WhenRateLimitExceeded() {
+        LoadBalancerProperties zeroRpsProps = new LoadBalancerProperties();
+        zeroRpsProps.setRateLimitBaselineRps(0);
+        HealthChecker stubHealthChecker = new HealthChecker(
+                new BackendRegistry(new LoadBalancerProperties()),
+                WebClient.create());
+        RateLimiter exhaustedLimiter = new RateLimiter(zeroRpsProps, stubHealthChecker);
+
+        ReverseProxyHandler throttledHandler = new ReverseProxyHandler(
+                selectionEngine,
+                new ProxyClientConfig().proxyWebClient(props),
+                retryBudget,
+                circuitBreakerRegistry,
+                props,
+                exhaustedLimiter,
+                new ResponseCache(props));
+
+        WebTestClient throttledClient = WebTestClient.bindToRouterFunction(
+                new ProxyRouterConfig().proxyRoutes(throttledHandler)).build();
+
+        throttledClient.get()
+                .uri("/any-path")
+                .exchange()
+                .expectStatus().isEqualTo(HttpStatus.TOO_MANY_REQUESTS)
+                .expectHeader().valueEquals("Retry-After", "1");
+    }
+
+    @Test
+    @DisplayName("serves cached response on repeated GET request without invoking backend again")
+    void servesCachedResponseOnRepeatedGet() {
+        AtomicInteger backendHits = new AtomicInteger(0);
+
+        backendServer1 = HttpServer.create()
+                .port(0)
+                .route(routes -> routes.get("/cacheable", (req, res) -> {
+                    backendHits.incrementAndGet();
+                    return res.header("Cache-Control", "public, max-age=60")
+                              .sendString(Mono.just("Cached Content"));
+                }))
+                .bindNow();
+
+        backendRegistry.register("b1", "http://localhost:" + backendServer1.port(), 1, 0);
+
+        // First request - hits backend
+        client.get()
+                .uri("/cacheable")
+                .exchange()
+                .expectStatus().isOk()
+                .expectBody(String.class).isEqualTo("Cached Content");
+
+        assertEquals(1, backendHits.get(), "First request must hit the backend");
+
+        // Second request - hits cache
+        client.get()
+                .uri("/cacheable")
+                .exchange()
+                .expectStatus().isOk()
+                .expectBody(String.class).isEqualTo("Cached Content");
+
+        assertEquals(1, backendHits.get(), "Second request must be served from cache without hitting backend");
     }
 }

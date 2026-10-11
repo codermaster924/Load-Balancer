@@ -105,4 +105,24 @@ public class BackendRegistry {
     public long healthyCount() {
         return nodes.values().stream().filter(ServerNode::isHealthy).count();
     }
+
+    /**
+     * Removes a backend node by id.
+     *
+     * <p>The node is atomically deregistered so the selection engine will no longer pick it.
+     * Any in-flight requests already dispatched to the node will complete naturally —
+     * they hold their connection reservation and decrement it via {@code doFinally}.</p>
+     *
+     * @param id the node id to remove
+     * @return {@code true} if the node was found and removed; {@code false} if id was unknown
+     */
+    public boolean remove(String id) {
+        ServerNode removed = nodes.remove(id);
+        if (removed != null) {
+            log.info("Deregistered backend node: '{}' (url={}, activeConnections={})",
+                    id, removed.getUrl(), removed.getActiveConnections());
+            return true;
+        }
+        return false;
+    }
 }

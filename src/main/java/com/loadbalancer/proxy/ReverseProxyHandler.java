@@ -1,7 +1,9 @@
 package com.loadbalancer.proxy;
 
+import com.loadbalancer.cache.ResponseCache;
 import com.loadbalancer.config.LoadBalancerProperties;
 import com.loadbalancer.resilience.CircuitBreakerRegistry;
+import com.loadbalancer.resilience.RateLimiter;
 import com.loadbalancer.resilience.RetryBudget;
 import com.loadbalancer.routing.NoAvailableBackendException;
 import com.loadbalancer.routing.SelectionEngine;
@@ -71,23 +73,56 @@ public class ReverseProxyHandler {
     private final RetryBudget retryBudget;
     private final CircuitBreakerRegistry circuitBreakerRegistry;
     private final LoadBalancerProperties props;
+    private final RateLimiter rateLimiter;
+    private final ResponseCache responseCache;
 
     public ReverseProxyHandler(SelectionEngine selectionEngine,
                                WebClient webClient,
                                RetryBudget retryBudget,
                                CircuitBreakerRegistry circuitBreakerRegistry,
-                               LoadBalancerProperties props) {
+                               LoadBalancerProperties props,
+                               RateLimiter rateLimiter,
+                               ResponseCache responseCache) {
         this.selectionEngine = selectionEngine;
         this.webClient = webClient;
         this.retryBudget = retryBudget;
         this.circuitBreakerRegistry = circuitBreakerRegistry;
         this.props = props;
+        this.rateLimiter = rateLimiter;
+        this.responseCache = responseCache;
     }
 
     /**
      * Entry point for incoming HTTP requests matching the proxy catch-all route.
+     *
+     * <p>Pipeline order per specification Section 3 (Request Pipeline Order):
+     * <ol>
+     *   <li>Rate limiter — reject with 429 if bucket is empty.</li>
+     *   <li>Cache lookup — return cached response immediately on GET hit.</li>
+     *   <li>Backend selection + upstream proxy (with retries).</li>
+     * </ol>
+     * </p>
      */
     public Mono<ServerResponse> handle(ServerRequest request) {
+        // ── Step 1: Rate limiter ───────────────────────────────────────────
+        if (!rateLimiter.tryAcquire()) {
+            log.debug("Rate limit exceeded for path: {}", request.path());
+            return ServerResponse.status(HttpStatus.TOO_MANY_REQUESTS)
+                    .header("Retry-After", "1")
+                    .bodyValue("429 Too Many Requests: rate limit exceeded");
+        }
+
+        // ── Step 2: Cache lookup (GET requests only) ───────────────────────
+        Optional<ResponseCache.CachedResponse> cached = responseCache.get(request);
+        if (cached.isPresent()) {
+            ResponseCache.CachedResponse hit = cached.get();
+            log.debug("Cache hit for: {}", request.uri());
+            return ServerResponse.status(hit.statusCode())
+                    .headers(h -> h.addAll(hit.headers()))
+                    .bodyValue(hit.body());
+        }
+
+        // ── Step 3: Forward to upstream backend ────────────────────────────
         retryBudget.recordRequest();
 
         boolean hasBody = hasRequestBody(request);
@@ -177,11 +212,27 @@ public class ReverseProxyHandler {
 
         // Normal response path: stream response body back to downstream client.
         // The in-flight connection reservation is released in doFinally when the body transfer finishes.
+        HttpHeaders upstreamHeaders = clientResponse.headers().asHttpHeaders();
+
+        // Cache-eligible: GET 200 — collect body to store, then emit to client
+        if (HttpMethod.GET.equals(originalRequest.method()) && status.value() == HttpStatus.OK.value()) {
+            return clientResponse.bodyToMono(byte[].class)
+                    .defaultIfEmpty(new byte[0])
+                    .doFinally(signalType -> reservation.release())
+                    .flatMap(bodyBytes -> {
+                        responseCache.put(originalRequest, bodyBytes, upstreamHeaders, status.value());
+                        return ServerResponse.status(status)
+                                .headers(h -> copyResponseHeaders(upstreamHeaders, h))
+                                .bodyValue(bodyBytes);
+                    });
+        }
+
+        // Non-cacheable: stream directly without buffering into memory
         Flux<DataBuffer> responseBody = clientResponse.body(BodyExtractors.toDataBuffers())
                 .doFinally(signalType -> reservation.release());
 
         return ServerResponse.status(status)
-                .headers(h -> copyResponseHeaders(clientResponse.headers().asHttpHeaders(), h))
+                .headers(h -> copyResponseHeaders(upstreamHeaders, h))
                 .body(BodyInserters.fromDataBuffers(responseBody));
     }
 
